@@ -1,17 +1,18 @@
 """
-Battlesnake Duel A* — smart pathfinding & safety-aware move selection
---------------------------------------------------------------------
+Battlesnake Duel A*+ — anticipatory pathfinding & robust safety checks
+---------------------------------------------------------------------
 One-file Flask app implementing an A*-driven strategy tailored for 1v1 (duel)
 Battlesnake. Designed to be readable, hackable, and strong out-of-the-box.
 
-Key features:
-- A* pathfinding with multi-goal support (e.g., all food squares)
-- Dynamic danger map (enemy head reach, bodies, future neck zones)
-- Head-to-head avoidance when out-sized or equal
-- Tail-chasing & food targeting with health-aware policy
-- Space (flood-fill) viability checks to avoid self-traps
-- Soft scoring that blends distance, risk, space, and center bias
-- Solid fallbacks when no A*-safe path exists
+Key upgrades vs baseline:
+- Enemy-aware lookahead (1-ply) with worst-case safety scoring
+- "Reachable food" filter: ignore food the enemy can claim strictly sooner
+- Smarter danger model (wall/corner bias, squeeze corridors, head-on rules)
+- Future-tail modeling (you & enemy) so stepping on a tail is allowed if it moves
+- True space viability: BFS area + path-to-tail/escape test
+- Risk-tuned soft scoring with smaller magic numbers collected in one config
+- Deterministic tie-breaking via seeded RNG from game state
+- Cleaner A* with heapq and closed set for speed
 
 No external dependencies besides Flask (which Battlesnake quickstarts already use).
 
@@ -22,11 +23,13 @@ Run locally:
 Deploy on Replit/Heroku/Render/Fly the same way as the official quickstarts.
 """
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Iterable
 from dataclasses import dataclass
 from collections import deque
 import math
 import os
+import random
+import heapq
 
 from flask import Flask, request, jsonify
 
@@ -98,30 +101,37 @@ def neighbors(board: Board, c: Coord) -> List[Coord]:
 # Board parsing & occupancy
 # -------------------------------
 
+# Handles both legacy {body: {data: [...]}} and modern {body: [...]} formats
+
+def _extract_body(raw) -> List[Coord]:
+    if isinstance(raw, dict) and isinstance(raw.get("data"), list):
+        return [(p["x"], p["y"]) for p in raw["data"]]
+    return [(p["x"], p["y"]) for p in raw]
+
+
 def parse_board(data: Dict) -> Board:
     width = data["board"]["width"]
     height = data["board"]["height"]
+
     you_raw = data["you"]
     you = Snake(
         id=you_raw["id"],
         health=you_raw["health"],
-        body=[(p["x"], p["y"]) for p in you_raw["body"]["data"] if isinstance(you_raw["body"], dict)]
-        if isinstance(you_raw.get("body"), dict)
-        else [(p["x"], p["y"]) for p in you_raw["body"]],
+        body=_extract_body(you_raw["body"]),
         length=you_raw["length"],
     )
 
-    # Battlesnake API v1 vs v2 compat for bodies
-    snakes = data["board"].get("snakes", [])
     opp: Optional[Snake] = None
-    for s in snakes:
+    for s in data["board"].get("snakes", []):
         if s["id"] == you.id:
             continue
-        body = [
-            (p["x"], p["y"]) for p in s["body"]["data"] if isinstance(s["body"], dict)
-        ] if isinstance(s.get("body"), dict) else [(p["x"], p["y"]) for p in s["body"]]
-        opp = Snake(id=s["id"], health=s["health"], body=body, length=s["length"])
-        break  # duel: at most one opponent matters
+        opp = Snake(
+            id=s["id"],
+            health=s["health"],
+            body=_extract_body(s["body"]),
+            length=s["length"],
+        )
+        break  # duel only
 
     food = set((f["x"], f["y"]) for f in data["board"].get("food", []))
     hazards = set((h["x"], h["y"]) for h in data["board"].get("hazards", []))
@@ -129,62 +139,128 @@ def parse_board(data: Dict) -> Board:
     return Board(width=width, height=height, food=food, hazards=hazards, you=you, opponent=opp)
 
 
-def occupied_squares(board: Board) -> Set[Coord]:
+def occupied_squares(board: Board, *, include_tails: bool = True) -> Set[Coord]:
     occ = set(board.you.body)
     if board.opponent:
         occ.update(board.opponent.body)
+    if not include_tails:
+        occ.discard(board.you.tail)
+        if board.opponent:
+            occ.discard(board.opponent.tail)
     return occ
+
+# -------------------------------
+# Distance maps & food reachability
+# -------------------------------
+
+def multi_source_bfs(board: Board, starts: Iterable[Coord], blocked: Set[Coord]) -> Dict[Coord, int]:
+    q = deque()
+    dist: Dict[Coord, int] = {}
+    for s in starts:
+        if s in blocked or not board.in_bounds(s):
+            continue
+        dist[s] = 0
+        q.append(s)
+    while q:
+        c = q.popleft()
+        d = dist[c]
+        for n in neighbors(board, c):
+            if n in blocked or n in dist:
+                continue
+            dist[n] = d + 1
+            q.append(n)
+    return dist
+
+
+def reachable_food(board: Board, blocked: Set[Coord]) -> Set[Coord]:
+    if not board.food:
+        return set()
+    mydist = multi_source_bfs(board, [board.you.head], blocked)
+    if board.opponent:
+        oddist = multi_source_bfs(board, [board.opponent.head], blocked)
+    else:
+        oddist = {}
+    good = set()
+    for f in board.food:
+        md = mydist.get(f, math.inf)
+        od = oddist.get(f, math.inf)
+        # Claim only if we arrive strictly sooner, or tie while longer (we can win head-to-head on food tile)
+        if md < od or (md == od and (not board.opponent or board.you.length > board.opponent.length)):
+            good.add(f)
+    return good
 
 # -------------------------------
 # Danger map & safety
 # -------------------------------
 
-def future_enemy_reach(board: Board) -> Set[Coord]:
-    """Squares the enemy head could move into next turn."""
-    reach = set()
-    if not board.opponent:
-        return reach
-    for n in neighbors(board, board.opponent.head):
-        reach.add(n)
-    return reach
+class Weights:
+    HARD_BLOCK = 1e6
+    HAZARD = 5.0
+    ENEMY_REACH_SAME_OR_LONGER = 30.0
+    ENEMY_REACH_SMALLER = 8.0
+    ENEMY_HEAD_RING = 4.0
+    WALL_HUG = 1.0
+    CORNER = 1.5
+    CORRIDOR_SQUEEZE = 3.5
+
+
+def future_head_reach(board: Board, head: Coord) -> Set[Coord]:
+    return {n for n in neighbors(board, head)}
+
+
+def is_corner(board: Board, c: Coord) -> bool:
+    x, y = c
+    return (x in (0, board.width - 1)) and (y in (0, board.height - 1))
+
+
+def corridor_sides(board: Board, c: Coord, blocked: Set[Coord]) -> int:
+    # Count blocked/out-of-bounds orthogonal neighbors — high means corridor
+    count = 0
+    for d in DIRS.values():
+        n = add(c, d)
+        if (not board.in_bounds(n)) or (n in blocked):
+            count += 1
+    return count
 
 
 def danger_map(board: Board) -> Dict[Coord, float]:
-    """Return a risk weight per cell. Higher is worse."""
     danger: Dict[Coord, float] = {}
-    occ = occupied_squares(board)
+    # We allow stepping on tails if they are likely to move next turn
+    occ = occupied_squares(board, include_tails=False)
 
-    # Hard walls & bodies are near-infinite cost (except tails that may move)
     for x in range(board.width):
         for y in range(board.height):
             c = (x, y)
-            if c in occ and c != board.you.tail:  # allow stepping onto own tail (likely moves)
-                danger[c] = 1e6
+            if c in occ:
+                danger[c] = Weights.HARD_BLOCK
             else:
                 danger[c] = 0.0
 
-    # Hazards cost (royale) — tune as needed
     for c in board.hazards:
-        if c in danger:
-            danger[c] += 5.0
+        danger[c] = danger.get(c, 0.0) + Weights.HAZARD
 
-    # Enemy head proximity
-    enemy_reach = future_enemy_reach(board)
+    # Wall/corner soft bias
+    for x in range(board.width):
+        for y in range(board.height):
+            c = (x, y)
+            if x in (0, board.width - 1) or y in (0, board.height - 1):
+                danger[c] += Weights.WALL_HUG
+            if is_corner(board, c):
+                danger[c] += Weights.CORNER
+
+    # Enemy head proximity and next-reach tiles
     if board.opponent:
-        # If enemy is same or larger, avoid their next squares hard
-        scale = 30.0 if board.opponent.length >= board.you.length else 8.0
-        for c in enemy_reach:
-            if c in danger:
-                danger[c] += scale
-        # Add a gradient around enemy head
+        ereach = future_head_reach(board, board.opponent.head)
+        scale = Weights.ENEMY_REACH_SAME_OR_LONGER if board.opponent.length >= board.you.length else Weights.ENEMY_REACH_SMALLER
+        for c in ereach:
+            danger[c] = danger.get(c, 0.0) + scale
         for n in neighbors(board, board.opponent.head):
-            if n in danger:
-                danger[n] += 4.0
+            danger[n] = danger.get(n, 0.0) + Weights.ENEMY_HEAD_RING
 
     return danger
 
 # -------------------------------
-# Flood fill to measure free space from a candidate cell
+# Flood fill & escape tests
 # -------------------------------
 
 def flood_area(board: Board, start: Coord, blocked: Set[Coord], limit: int = 250) -> int:
@@ -203,8 +279,43 @@ def flood_area(board: Board, start: Coord, blocked: Set[Coord], limit: int = 250
             q.append(n)
     return count
 
+
+def has_escape(board: Board, start: Coord, blocked: Set[Coord]) -> bool:
+    """Cheap check: from start, can we reach our (future) tail OR have area >= length?"""
+    area = flood_area(board, start, blocked)
+    if area >= board.you.length:
+        return True
+    # Allow stepping on our own tail if it moves (simulate that next turn tail pops)
+    tail = board.you.tail
+    if tail not in blocked:
+        # already free
+        if _reachable(board, start, tail, blocked):
+            return True
+    else:
+        # assume tail vacates next turn
+        blocked2 = set(blocked)
+        blocked2.discard(tail)
+        if _reachable(board, start, tail, blocked2):
+            return True
+    return False
+
+
+def _reachable(board: Board, a: Coord, b: Coord, blocked: Set[Coord]) -> bool:
+    q = deque([a])
+    seen = {a}
+    while q:
+        c = q.popleft()
+        if c == b:
+            return True
+        for n in neighbors(board, c):
+            if n in seen or n in blocked:
+                continue
+            seen.add(n)
+            q.append(n)
+    return False
+
 # -------------------------------
-# A* pathfinding
+# A* pathfinding (heapq)
 # -------------------------------
 
 def astar(board: Board, start: Coord, goals: Set[Coord], danger: Dict[Coord, float]) -> Optional[List[Coord]]:
@@ -212,164 +323,181 @@ def astar(board: Board, start: Coord, goals: Set[Coord], danger: Dict[Coord, flo
         return None
 
     def heuristic(c: Coord) -> float:
-        # Nearest-goal Manhattan + a light center bias
         dmin = min(manhattan(c, g) for g in goals)
         cx = board.width / 2.0
         cy = board.height / 2.0
         center = abs(c[0] - cx) + abs(c[1] - cy)
         return dmin + 0.05 * center
 
-    open_set: Set[Coord] = {start}
+    open_heap: List[Tuple[float, Coord]] = []
+    heapq.heappush(open_heap, (heuristic(start), start))
     came_from: Dict[Coord, Coord] = {}
     g: Dict[Coord, float] = {start: 0.0}
-    f: Dict[Coord, float] = {start: heuristic(start)}
+    closed: Set[Coord] = set()
 
-    # Use a simple loop to select min f (board sizes are small)
-    while open_set:
-        current = min(open_set, key=lambda c: f.get(c, math.inf))
+    while open_heap:
+        _, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue
         if current in goals:
-            # Reconstruct path (excluding start, including current)
             path = [current]
             while current in came_from:
                 current = came_from[current]
                 path.append(current)
             path.reverse()
             return path
-
-        open_set.remove(current)
-
+        closed.add(current)
         for n in neighbors(board, current):
-            # Cost to enter neighbor includes danger
-            base = 1.0
-            cost = base + danger.get(n, 0.0)
-            tentative_g = g[current] + cost
+            # hard blocks are already in high danger; skip to prune
+            if danger.get(n, 0.0) >= Weights.HARD_BLOCK:
+                continue
+            tentative_g = g[current] + 1.0 + danger.get(n, 0.0)
             if tentative_g < g.get(n, math.inf):
                 came_from[n] = current
                 g[n] = tentative_g
-                f[n] = tentative_g + heuristic(n)
-                if n not in open_set:
-                    open_set.add(n)
-
+                f = tentative_g + heuristic(n)
+                heapq.heappush(open_heap, (f, n))
     return None
+
+# -------------------------------
+# Enemy lookahead (1-ply worst-case)
+# -------------------------------
+
+def enemy_best_reply_penalty(board: Board, my_next: Coord, blocked: Set[Coord]) -> float:
+    """Estimate extra risk if opponent chooses an adversarial move next.
+    Penalize if they can move adjacent/head-on to us while >= length.
+    """
+    if not board.opponent:
+        return 0.0
+    my_len = board.you.length
+    opp_len = board.opponent.length
+    worst = 0.0
+
+    # Possible enemy next positions (avoid hard walls)
+    ereach = [n for n in neighbors(board, board.opponent.head) if n not in blocked]
+    for epos in ereach:
+        # If enemy reaches our my_next simultaneously and is >= length -> huge penalty
+        if epos == my_next and opp_len >= my_len:
+            worst = max(worst, 60.0)
+        # If enemy becomes adjacent to our head after our move, add some risk
+        if manhattan(epos, my_next) == 1 and opp_len >= my_len:
+            worst = max(worst, 25.0)
+    return worst
 
 # -------------------------------
 # Move scoring / policy
 # -------------------------------
 
-def choose_move(board: Board) -> str:
-    occ = occupied_squares(board)
+def choose_move(board: Board, seed: Optional[int] = None) -> str:
+    # Deterministic randomness for tie-breaking
+    rnd = random.Random(seed)
+
+    occ_with_tails = occupied_squares(board, include_tails=True)
+    occ_no_tails = occupied_squares(board, include_tails=False)
     danger = danger_map(board)
 
     head = board.you.head
 
-    # Candidate next squares by direction
     candidates: List[Tuple[str, Coord]] = []
     for dname, delta in DIRS.items():
         nxt = add(head, delta)
         if board.in_bounds(nxt):
             candidates.append((dname, nxt))
 
-    # Filter out immediate death (hard walls/bodies)
+    # Filter immediate death
     safe: List[Tuple[str, Coord]] = []
     for dname, nxt in candidates:
-        if danger.get(nxt, 0.0) >= 1e6:  # hard block
+        if danger.get(nxt, 0.0) >= Weights.HARD_BLOCK:
             continue
         safe.append((dname, nxt))
 
     if not safe:
-        # No safe squares; choose the least bad to survive potential tail move
-        least = min(candidates, key=lambda kv: danger.get(kv[1], 1e9))
+        # All bad — pick least terrible (prefer open squares)
+        least = min(candidates, key=lambda kv: (danger.get(kv[1], 1e9), -len([n for n in neighbors(board, kv[1]) if n not in occ_with_tails])))
         return least[0]
 
-    # Health-driven goal selection
-    go_for_food = board.you.health <= 35 or (board.opponent and board.you.length <= board.opponent.length - 2)
+    # Health-driven goal selection with reachable food filter
+    need_food = board.you.health <= 35 or (board.opponent and board.you.length <= board.opponent.length - 2)
+
+    # Build blocked map for reachability calcs (allow tails to move next turn)
+    blocked_for_paths = set(occ_no_tails)
 
     goals: Set[Coord] = set()
-    if go_for_food and board.food:
-        goals = set(board.food)
-    else:
-        # Chase space/center or enemy tail (safer than head)
-        goals = set()
+    if need_food and board.food:
+        good_food = reachable_food(board, blocked_for_paths)
+        if good_food:
+            goals = good_food
+    if not goals:
+        # Chase center & enemy tail (safer than head)
         if board.opponent:
             goals.add(board.opponent.tail)
-        # Add soft-center pseudo-goals to encourage space
-        center_targets = [
-            (board.width // 2, board.height // 2),
-            (max(0, board.width // 2 - 1), board.height // 2),
-            (board.width // 2, max(0, board.height // 2 - 1)),
-        ]
+        cx, cy = board.width // 2, board.height // 2
+        center_targets = [(cx, cy), (max(0, cx - 1), cy), (cx, max(0, cy - 1))]
         goals.update(c for c in center_targets if board.in_bounds(c))
 
-    # A* towards goals, then evaluate each candidate by resulting path, danger, and area
+    # Score each candidate
     scored: List[Tuple[float, str]] = []
-    blocked = set(occ)
-    # Allow our tail to vacate
-    blocked.discard(board.you.tail)
 
     for dname, nxt in safe:
-        # Quick area check to avoid tiny pockets
-        area = flood_area(board, nxt, blocked)
-        area_score = 0.0
-        if area < max(5, board.you.length // 2):
-            area_score += 50.0  # very cramped
-        elif area < board.you.length:
-            area_score += 12.0
+        # Corridor squeeze penalty
+        squeeze = corridor_sides(board, nxt, occ_with_tails)
+        corridor_pen = Weights.CORRIDOR_SQUEEZE if squeeze >= 3 else 0.0
 
-        # Temporarily mark our next as occupied for path calc realism
-        temp_block = set(blocked)
+        # Soft bias away from stepping into our neck
+        neck_pen = 0.0
+        if len(board.you.body) >= 2 and nxt == board.you.body[1]:
+            neck_pen = 8.0
+
+        # Temporarily mark our next as occupied for realism
+        temp_block = set(occ_no_tails)
         temp_block.add(nxt)
 
-        # Build a temporary danger overlay that discourages stepping into traps
-        temp_danger = dict(danger)
-        # Mild penalty for hugging walls (discourage corridor traps)
-        x, y = nxt
-        if x == 0 or y == 0 or x == board.width - 1 or y == board.height - 1:
-            temp_danger[nxt] = temp_danger.get(nxt, 0.0) + 2.0
-
-        # Compute a path from NEXT square to goals
-        path = astar(board, nxt, goals, temp_danger)
-
-        # Path length & risk
+        # Path from NEXT to goals
+        path = astar(board, nxt, goals, danger)
         if path:
-            # Sum risk along path (skip the start cell nxt, already counted)
-            risk_along = sum(temp_danger.get(c, 0.0) for c in path[1:])
+            risk_along = sum(danger.get(c, 0.0) for c in path[1:])
             dist = len(path) - 1
         else:
-            # No path — heavily penalize unless we are not pursuing any hard goal
             risk_along = 80.0
             dist = 20
 
-        # Enemy head-to-head risk if moving adjacent to enemy head
-        h2h_penalty = 0.0
-        if board.opponent:
-            if manhattan(nxt, board.opponent.head) == 1 and board.opponent.length >= board.you.length:
-                h2h_penalty += 40.0
+        # Area/escape checks
+        area = flood_area(board, nxt, occ_with_tails)
+        area_pen = 0.0
+        if area < max(5, board.you.length // 2):
+            area_pen += 50.0
+        elif area < board.you.length:
+            area_pen += 12.0
+        if not has_escape(board, nxt, occ_with_tails):
+            area_pen += 25.0
 
-        # Base move risk from danger map
+        # Enemy lookahead penalty
+        reply_pen = enemy_best_reply_penalty(board, nxt, occ_with_tails)
+
+        # Base risk from static danger
         base_risk = danger.get(nxt, 0.0)
 
-        # Score = lower is better
+        # Compose score
         score = (
             base_risk
-            + h2h_penalty
-            + area_score
+            + corridor_pen
+            + neck_pen
+            + area_pen
             + 0.8 * dist
-            + 0.15 * risk_along
+            + 0.12 * risk_along
+            + reply_pen
         )
-        # Prefer food square lightly when we need food
-        if go_for_food and nxt in board.food:
-            score -= 5.0
 
-        # Light bias to not reverse into our neck if it reduces options
-        if len(board.you.body) >= 2:
-            neck = board.you.body[1]
-            if nxt == neck:
-                score += 8.0
+        # Prefer food tile if we truly need food
+        if need_food and nxt in board.food:
+            score -= 6.0
 
         scored.append((score, dname))
 
-    scored.sort()
-    best_move = scored[0][1]
+    # Tie-break: shuffle tiny jitters for stability
+    jittered = [(s + 1e-6 * rnd.random(), m) for s, m in scored]
+    jittered.sort()
+    best_move = jittered[0][1]
     return best_move
 
 # -------------------------------
@@ -386,15 +514,20 @@ def index():
         "color": "#4f46e5",
         "head": "smart-caterpillar",
         "tail": "pixel",
-        "version": "duel-astar-1.0",
+        "version": "duel-astar-1.1",
     })
 
 @app.post("/move")
 def move():
     data = request.get_json()
     board = parse_board(data)
-    move_dir = choose_move(board)
-    return jsonify({"move": move_dir, "shout": "A* online"})
+    # Seed randomness from board state for deterministic but varied tie-breaks
+    seed = (
+        hash((board.width, board.height, board.you.head, tuple(board.food)))
+        ^ (board.opponent.length if board.opponent else 0)
+    ) & 0xFFFFFFFF
+    move_dir = choose_move(board, seed=seed)
+    return jsonify({"move": move_dir, "shout": "A*+ online"})
 
 @app.post("/start")
 def start():
@@ -403,7 +536,7 @@ def start():
 @app.post("/end")
 def end():
     return ("", 200)
-#ghjk
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
