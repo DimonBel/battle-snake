@@ -1,375 +1,409 @@
 """
-BattleSnake AI Bot inspired by geometric decision tree algorithms
-Based on strategic spatial reasoning and efficient search strategies
+Battlesnake Duel A* — smart pathfinding & safety-aware move selection
+--------------------------------------------------------------------
+One-file Flask app implementing an A*-driven strategy tailored for 1v1 (duel)
+Battlesnake. Designed to be readable, hackable, and strong out-of-the-box.
+
+Key features:
+- A* pathfinding with multi-goal support (e.g., all food squares)
+- Dynamic danger map (enemy head reach, bodies, future neck zones)
+- Head-to-head avoidance when out-sized or equal
+- Tail-chasing & food targeting with health-aware policy
+- Space (flood-fill) viability checks to avoid self-traps
+- Soft scoring that blends distance, risk, space, and center bias
+- Solid fallbacks when no A*-safe path exists
+
+No external dependencies besides Flask (which Battlesnake quickstarts already use).
+
+Run locally:
+  export PORT=8000
+  python app.py
+
+Deploy on Replit/Heroku/Render/Fly the same way as the official quickstarts.
 """
+from __future__ import annotations
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass
+from collections import deque
+import math
+import os
 
-from typing import Dict, List, Tuple, Set
-import random
+from flask import Flask, request, jsonify
+
+# -------------------------------
+# Data structures
+# -------------------------------
+
+Coord = Tuple[int, int]
+
+@dataclass
+class Snake:
+    id: str
+    health: int
+    body: List[Coord]  # head first
+    length: int
+
+    @property
+    def head(self) -> Coord:
+        return self.body[0]
+
+    @property
+    def tail(self) -> Coord:
+        return self.body[-1]
+
+@dataclass
+class Board:
+    width: int
+    height: int
+    food: Set[Coord]
+    hazards: Set[Coord]
+    you: Snake
+    opponent: Optional[Snake]
+
+    def in_bounds(self, c: Coord) -> bool:
+        x, y = c
+        return 0 <= x < self.width and 0 <= y < self.height
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
+DIRS: Dict[str, Coord] = {
+    "up": (0, 1),
+    "down": (0, -1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
+INV_DIR: Dict[Coord, str] = {v: k for k, v in DIRS.items()}
 
 
-class BattleSnakeBot:
-    """
-    BattleSnake bot using decision tree-inspired strategies
-    Implements spatial analysis and strategic movement planning
-    """
-    
-    def __init__(self):
-        self.directions = ["up", "down", "left", "right"]
-        self.move_vectors = {
-            "up": (0, -1),
-            "down": (0, 1),
-            "left": (-1, 0),
-            "right": (1, 0)
-        }
-    
-    def get_move(self, game_state: Dict) -> str:
-        """
-        Main decision function - returns the best move
-        """
-        board = game_state["board"]
-        my_snake = game_state["you"]
-        my_head = my_snake["head"]
-        my_body = my_snake["body"]
-        health = my_snake["health"]
-        
-        # Build occupancy map (inspired by battleship grid analysis)
-        occupied = self._build_occupied_set(board, my_snake)
-        
-        # Calculate safe moves using decision tree approach
-        safe_moves = self._get_safe_moves(my_head, occupied, board)
-        
-        if not safe_moves:
-            # Last resort - try any move
-            return random.choice(self.directions)
-        
-        # Strategic move selection (inspired by minimizing "misses")
-        
-        # Priority 1: If low health, aggressively seek food
-        if health < 30:
-            food_move = self._move_toward_closest_food(
-                my_head, board["food"], safe_moves, occupied, board
-            )
-            if food_move:
-                return food_move
-        
-        # Priority 2: Control space (maximize reachable area)
-        space_scores = self._evaluate_space_control(
-            my_head, safe_moves, occupied, board
-        )
-        
-        # Priority 3: Avoid head-to-head with larger snakes
-        space_scores = self._avoid_larger_snakes(
-            my_head, safe_moves, space_scores, board, my_snake
-        )
-        
-        # Priority 4: Seek food opportunistically
-        if health < 70:
-            food_bonus = self._calculate_food_bonus(
-                my_head, board["food"], safe_moves
-            )
-            for move in safe_moves:
-                space_scores[move] += food_bonus.get(move, 0)
-        
-        # Select move with highest score
-        best_move = max(safe_moves, key=lambda m: space_scores[m])
-        return best_move
-    
-    def _build_occupied_set(self, board: Dict, my_snake: Dict) -> Set[Tuple[int, int]]:
-        """
-        Build set of occupied cells (inspired by shape detection in battleship)
-        """
-        occupied = set()
-        
-        # Add all snake bodies
-        for snake in board["snakes"]:
-            for segment in snake["body"][:-1]:  # Exclude tail (it moves)
-                occupied.add((segment["x"], segment["y"]))
-        
-        return occupied
-    
-    def _get_safe_moves(
-        self, head: Dict, occupied: Set[Tuple[int, int]], board: Dict
-    ) -> List[str]:
-        """
-        Get moves that don't immediately result in death
-        Uses decision tree logic to prune unsafe branches
-        """
-        safe = []
-        width = board["width"]
-        height = board["height"]
-        
-        for direction in self.directions:
-            dx, dy = self.move_vectors[direction]
-            new_x = head["x"] + dx
-            new_y = head["y"] + dy
-            
-            # Check bounds
-            if not (0 <= new_x < width and 0 <= new_y < height):
-                continue
-            
-            # Check collision
-            if (new_x, new_y) in occupied:
-                continue
-            
-            safe.append(direction)
-        
-        return safe
-    
-    def _move_toward_closest_food(
-        self,
-        head: Dict,
-        food: List[Dict],
-        safe_moves: List[str],
-        occupied: Set[Tuple[int, int]],
-        board: Dict
-    ) -> str:
-        """
-        Move toward closest food using Manhattan distance
-        Inspired by directional search in battleship algorithms
-        """
-        if not food:
-            return None
-        
-        # Find closest food
-        min_dist = float('inf')
-        target = None
-        for f in food:
-            dist = abs(f["x"] - head["x"]) + abs(f["y"] - head["y"])
-            if dist < min_dist:
-                min_dist = dist
-                target = f
-        
-        if not target:
-            return None
-        
-        # Score moves by distance to target
-        best_move = None
-        best_score = float('inf')
-        
-        for move in safe_moves:
-            dx, dy = self.move_vectors[move]
-            new_x = head["x"] + dx
-            new_y = head["y"] + dy
-            
-            # Check if path is somewhat clear
-            if not self._has_escape_path((new_x, new_y), occupied, board):
-                continue
-            
-            dist = abs(target["x"] - new_x) + abs(target["y"] - new_y)
-            if dist < best_score:
-                best_score = dist
-                best_move = move
-        
-        return best_move
-    
-    def _evaluate_space_control(
-        self,
-        head: Dict,
-        safe_moves: List[str],
-        occupied: Set[Tuple[int, int]],
-        board: Dict
-    ) -> Dict[str, float]:
-        """
-        Evaluate reachable space for each move using flood fill
-        Inspired by area coverage in battleship strategies
-        """
-        scores = {}
-        
-        for move in safe_moves:
-            dx, dy = self.move_vectors[move]
-            new_pos = (head["x"] + dx, head["y"] + dy)
-            
-            # Flood fill to count reachable squares
-            reachable = self._flood_fill(new_pos, occupied, board, max_depth=10)
-            scores[move] = len(reachable)
-        
-        return scores
-    
-    def _flood_fill(
-        self,
-        start: Tuple[int, int],
-        occupied: Set[Tuple[int, int]],
-        board: Dict,
-        max_depth: int = 10
-    ) -> Set[Tuple[int, int]]:
-        """
-        Flood fill to count reachable area (limited depth for performance)
-        """
-        width = board["width"]
-        height = board["height"]
-        visited = {start}
-        queue = [(start, 0)]
-        idx = 0
-        
-        while idx < len(queue) and len(visited) < 100:  # Limit for performance
-            (x, y), depth = queue[idx]
-            idx += 1
-            
-            if depth >= max_depth:
-                continue
-            
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = x + dx, y + dy
-                
-                if not (0 <= nx < width and 0 <= ny < height):
-                    continue
-                if (nx, ny) in occupied or (nx, ny) in visited:
-                    continue
-                
-                visited.add((nx, ny))
-                queue.append(((nx, ny), depth + 1))
-        
-        return visited
-    
-    def _has_escape_path(
-        self,
-        pos: Tuple[int, int],
-        occupied: Set[Tuple[int, int]],
-        board: Dict
-    ) -> bool:
-        """
-        Check if position has reasonable escape routes
-        """
-        reachable = self._flood_fill(pos, occupied, board, max_depth=5)
-        return len(reachable) >= 4  # Need some room to maneuver
-    
-    def _avoid_larger_snakes(
-        self,
-        head: Dict,
-        safe_moves: List[str],
-        scores: Dict[str, float],
-        board: Dict,
-        my_snake: Dict
-    ) -> Dict[str, float]:
-        """
-        Penalize moves that could lead to head-to-head with larger snakes
-        """
-        my_length = len(my_snake["body"])
-        
-        for move in safe_moves:
-            dx, dy = self.move_vectors[move]
-            new_x = head["x"] + dx
-            new_y = head["y"] + dy
-            
-            # Check adjacent cells for enemy snake heads
-            for snake in board["snakes"]:
-                if snake["id"] == my_snake["id"]:
-                    continue
-                
-                enemy_head = snake["head"]
-                enemy_length = len(snake["body"])
-                
-                # Check if enemy could move to adjacent cell
-                for edx, edy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    if (enemy_head["x"] + edx == new_x and 
-                        enemy_head["y"] + edy == new_y):
-                        
-                        if enemy_length >= my_length:
-                            # Heavily penalize head-to-head with larger/equal snake
-                            scores[move] -= 100
-        
-        return scores
-    
-    def _calculate_food_bonus(
-        self, head: Dict, food: List[Dict], safe_moves: List[str]
-    ) -> Dict[str, float]:
-        """
-        Calculate bonus for moves toward food
-        """
-        bonus = {}
-        if not food:
-            return bonus
-        
-        for move in safe_moves:
-            dx, dy = self.move_vectors[move]
-            new_x = head["x"] + dx
-            new_y = head["y"] + dy
-            
-            # Find closest food to new position
-            min_dist = float('inf')
-            for f in food:
-                dist = abs(f["x"] - new_x) + abs(f["y"] - new_y)
-                min_dist = min(min_dist, dist)
-            
-            # Bonus inversely proportional to distance
-            if min_dist > 0:
-                bonus[move] = 20.0 / min_dist
+def add(a: Coord, b: Coord) -> Coord:
+    return (a[0] + b[0], a[1] + b[1])
+
+
+def manhattan(a: Coord, b: Coord) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def neighbors(board: Board, c: Coord) -> List[Coord]:
+    res = []
+    for d in DIRS.values():
+        n = add(c, d)
+        if board.in_bounds(n):
+            res.append(n)
+    return res
+
+# -------------------------------
+# Board parsing & occupancy
+# -------------------------------
+
+def parse_board(data: Dict) -> Board:
+    width = data["board"]["width"]
+    height = data["board"]["height"]
+    you_raw = data["you"]
+    you = Snake(
+        id=you_raw["id"],
+        health=you_raw["health"],
+        body=[(p["x"], p["y"]) for p in you_raw["body"]["data"] if isinstance(you_raw["body"], dict)]
+        if isinstance(you_raw.get("body"), dict)
+        else [(p["x"], p["y"]) for p in you_raw["body"]],
+        length=you_raw["length"],
+    )
+
+    # Battlesnake API v1 vs v2 compat for bodies
+    snakes = data["board"].get("snakes", [])
+    opp: Optional[Snake] = None
+    for s in snakes:
+        if s["id"] == you.id:
+            continue
+        body = [
+            (p["x"], p["y"]) for p in s["body"]["data"] if isinstance(s["body"], dict)
+        ] if isinstance(s.get("body"), dict) else [(p["x"], p["y"]) for p in s["body"]]
+        opp = Snake(id=s["id"], health=s["health"], body=body, length=s["length"])
+        break  # duel: at most one opponent matters
+
+    food = set((f["x"], f["y"]) for f in data["board"].get("food", []))
+    hazards = set((h["x"], h["y"]) for h in data["board"].get("hazards", []))
+
+    return Board(width=width, height=height, food=food, hazards=hazards, you=you, opponent=opp)
+
+
+def occupied_squares(board: Board) -> Set[Coord]:
+    occ = set(board.you.body)
+    if board.opponent:
+        occ.update(board.opponent.body)
+    return occ
+
+# -------------------------------
+# Danger map & safety
+# -------------------------------
+
+def future_enemy_reach(board: Board) -> Set[Coord]:
+    """Squares the enemy head could move into next turn."""
+    reach = set()
+    if not board.opponent:
+        return reach
+    for n in neighbors(board, board.opponent.head):
+        reach.add(n)
+    return reach
+
+
+def danger_map(board: Board) -> Dict[Coord, float]:
+    """Return a risk weight per cell. Higher is worse."""
+    danger: Dict[Coord, float] = {}
+    occ = occupied_squares(board)
+
+    # Hard walls & bodies are near-infinite cost (except tails that may move)
+    for x in range(board.width):
+        for y in range(board.height):
+            c = (x, y)
+            if c in occ and c != board.you.tail:  # allow stepping onto own tail (likely moves)
+                danger[c] = 1e6
             else:
-                bonus[move] = 100  # Food is on this square!
-        
-        return bonus
+                danger[c] = 0.0
 
+    # Hazards cost (royale) — tune as needed
+    for c in board.hazards:
+        if c in danger:
+            danger[c] += 5.0
 
-# BattleSnake API endpoints
-def info() -> Dict:
-    """
-    Return snake appearance and metadata
-    """
-    return {
-        "apiversion": "1",
-        "author": "Strategic-AI",
-        "color": "#00FF00",
-        "head": "default",
-        "tail": "default",
-    }
+    # Enemy head proximity
+    enemy_reach = future_enemy_reach(board)
+    if board.opponent:
+        # If enemy is same or larger, avoid their next squares hard
+        scale = 30.0 if board.opponent.length >= board.you.length else 8.0
+        for c in enemy_reach:
+            if c in danger:
+                danger[c] += scale
+        # Add a gradient around enemy head
+        for n in neighbors(board, board.opponent.head):
+            if n in danger:
+                danger[n] += 4.0
 
+    return danger
 
-def start(game_state: Dict):
-    """
-    Called when a new game starts
-    """
-    print(f"Game {game_state['game']['id']} started!")
+# -------------------------------
+# Flood fill to measure free space from a candidate cell
+# -------------------------------
 
+def flood_area(board: Board, start: Coord, blocked: Set[Coord], limit: int = 250) -> int:
+    if not board.in_bounds(start) or start in blocked:
+        return 0
+    q = deque([start])
+    seen = {start}
+    count = 0
+    while q and count < limit:
+        c = q.popleft()
+        count += 1
+        for n in neighbors(board, c):
+            if n in seen or n in blocked or not board.in_bounds(n):
+                continue
+            seen.add(n)
+            q.append(n)
+    return count
 
-def move(game_state: Dict) -> Dict:
-    """
-    Called on each turn - return the move decision
-    """
-    bot = BattleSnakeBot()
-    chosen_move = bot.get_move(game_state)
-    
-    print(f"Turn {game_state['turn']}: Moving {chosen_move}")
-    
-    return {
-        "move": chosen_move,
-        "shout": "Strategizing!"
-    }
+# -------------------------------
+# A* pathfinding
+# -------------------------------
 
+def astar(board: Board, start: Coord, goals: Set[Coord], danger: Dict[Coord, float]) -> Optional[List[Coord]]:
+    if not goals:
+        return None
 
-def end(game_state: Dict):
-    """
-    Called when the game ends
-    """
-    print(f"Game {game_state['game']['id']} ended!")
+    def heuristic(c: Coord) -> float:
+        # Nearest-goal Manhattan + a light center bias
+        dmin = min(manhattan(c, g) for g in goals)
+        cx = board.width / 2.0
+        cy = board.height / 2.0
+        center = abs(c[0] - cx) + abs(c[1] - cy)
+        return dmin + 0.05 * center
 
+    open_set: Set[Coord] = {start}
+    came_from: Dict[Coord, Coord] = {}
+    g: Dict[Coord, float] = {start: 0.0}
+    f: Dict[Coord, float] = {start: heuristic(start)}
 
-# Flask server setup - app at module level for deployment
-from flask import Flask, request
+    # Use a simple loop to select min f (board sizes are small)
+    while open_set:
+        current = min(open_set, key=lambda c: f.get(c, math.inf))
+        if current in goals:
+            # Reconstruct path (excluding start, including current)
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            path.reverse()
+            return path
+
+        open_set.remove(current)
+
+        for n in neighbors(board, current):
+            # Cost to enter neighbor includes danger
+            base = 1.0
+            cost = base + danger.get(n, 0.0)
+            tentative_g = g[current] + cost
+            if tentative_g < g.get(n, math.inf):
+                came_from[n] = current
+                g[n] = tentative_g
+                f[n] = tentative_g + heuristic(n)
+                if n not in open_set:
+                    open_set.add(n)
+
+    return None
+
+# -------------------------------
+# Move scoring / policy
+# -------------------------------
+
+def choose_move(board: Board) -> str:
+    occ = occupied_squares(board)
+    danger = danger_map(board)
+
+    head = board.you.head
+
+    # Candidate next squares by direction
+    candidates: List[Tuple[str, Coord]] = []
+    for dname, delta in DIRS.items():
+        nxt = add(head, delta)
+        if board.in_bounds(nxt):
+            candidates.append((dname, nxt))
+
+    # Filter out immediate death (hard walls/bodies)
+    safe: List[Tuple[str, Coord]] = []
+    for dname, nxt in candidates:
+        if danger.get(nxt, 0.0) >= 1e6:  # hard block
+            continue
+        safe.append((dname, nxt))
+
+    if not safe:
+        # No safe squares; choose the least bad to survive potential tail move
+        least = min(candidates, key=lambda kv: danger.get(kv[1], 1e9))
+        return least[0]
+
+    # Health-driven goal selection
+    go_for_food = board.you.health <= 35 or (board.opponent and board.you.length <= board.opponent.length - 2)
+
+    goals: Set[Coord] = set()
+    if go_for_food and board.food:
+        goals = set(board.food)
+    else:
+        # Chase space/center or enemy tail (safer than head)
+        goals = set()
+        if board.opponent:
+            goals.add(board.opponent.tail)
+        # Add soft-center pseudo-goals to encourage space
+        center_targets = [
+            (board.width // 2, board.height // 2),
+            (max(0, board.width // 2 - 1), board.height // 2),
+            (board.width // 2, max(0, board.height // 2 - 1)),
+        ]
+        goals.update(c for c in center_targets if board.in_bounds(c))
+
+    # A* towards goals, then evaluate each candidate by resulting path, danger, and area
+    scored: List[Tuple[float, str]] = []
+    blocked = set(occ)
+    # Allow our tail to vacate
+    blocked.discard(board.you.tail)
+
+    for dname, nxt in safe:
+        # Quick area check to avoid tiny pockets
+        area = flood_area(board, nxt, blocked)
+        area_score = 0.0
+        if area < max(5, board.you.length // 2):
+            area_score += 50.0  # very cramped
+        elif area < board.you.length:
+            area_score += 12.0
+
+        # Temporarily mark our next as occupied for path calc realism
+        temp_block = set(blocked)
+        temp_block.add(nxt)
+
+        # Build a temporary danger overlay that discourages stepping into traps
+        temp_danger = dict(danger)
+        # Mild penalty for hugging walls (discourage corridor traps)
+        x, y = nxt
+        if x == 0 or y == 0 or x == board.width - 1 or y == board.height - 1:
+            temp_danger[nxt] = temp_danger.get(nxt, 0.0) + 2.0
+
+        # Compute a path from NEXT square to goals
+        path = astar(board, nxt, goals, temp_danger)
+
+        # Path length & risk
+        if path:
+            # Sum risk along path (skip the start cell nxt, already counted)
+            risk_along = sum(temp_danger.get(c, 0.0) for c in path[1:])
+            dist = len(path) - 1
+        else:
+            # No path — heavily penalize unless we are not pursuing any hard goal
+            risk_along = 80.0
+            dist = 20
+
+        # Enemy head-to-head risk if moving adjacent to enemy head
+        h2h_penalty = 0.0
+        if board.opponent:
+            if manhattan(nxt, board.opponent.head) == 1 and board.opponent.length >= board.you.length:
+                h2h_penalty += 40.0
+
+        # Base move risk from danger map
+        base_risk = danger.get(nxt, 0.0)
+
+        # Score = lower is better
+        score = (
+            base_risk
+            + h2h_penalty
+            + area_score
+            + 0.8 * dist
+            + 0.15 * risk_along
+        )
+        # Prefer food square lightly when we need food
+        if go_for_food and nxt in board.food:
+            score -= 5.0
+
+        # Light bias to not reverse into our neck if it reduces options
+        if len(board.you.body) >= 2:
+            neck = board.you.body[1]
+            if nxt == neck:
+                score += 8.0
+
+        scored.append((score, dname))
+
+    scored.sort()
+    best_move = scored[0][1]
+    return best_move
+
+# -------------------------------
+# Flask server
+# -------------------------------
 
 app = Flask(__name__)
 
+@app.get("/")
+def index():
+    return jsonify({
+        "apiversion": "1",
+        "author": "gpt5-thinking",
+        "color": "#4f46e5",
+        "head": "smart-caterpillar",
+        "tail": "pixel",
+        "version": "duel-astar-1.0",
+    })
 
-@app.route("/", methods=["GET"])
-def handle_info():
-    return info()
+@app.post("/move")
+def move():
+    data = request.get_json()
+    board = parse_board(data)
+    move_dir = choose_move(board)
+    return jsonify({"move": move_dir, "shout": "A* online"})
 
-@app.route("/start", methods=["POST"])
-def handle_start():
-    game_state = request.get_json()
-    start(game_state)
-    return "ok"
+@app.post("/start")
+def start():
+    return ("", 200)
 
-@app.route("/move", methods=["POST"])
-def handle_move():
-    game_state = request.get_json()
-    return move(game_state)
+@app.post("/end")
+def end():
+    return ("", 200)
 
-@app.route("/end", methods=["POST"])
-def handle_end():
-    game_state = request.get_json()
-    end(game_state)
-    return "ok"
-
-# For local development
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
