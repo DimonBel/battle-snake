@@ -1,3 +1,8 @@
+"""
+BattleSnake AI Bot inspired by geometric decision tree algorithms
+Based on strategic spatial reasoning and efficient search strategies
+"""
+
 from typing import Dict, List, Tuple, Set
 import random
 
@@ -338,36 +343,36 @@ def end(game_state: Dict):
     print(f"Game {game_state['game']['id']} ended!")
 
 
-# Flask server setup (if running as web service)
+# Flask server setup - app at module level for deployment
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "BattleSnake Strategic AI Bot is running!"
+
+@app.route("/info", methods=["GET"])
+def handle_info():
+    return info()
+
+@app.route("/start", methods=["POST"])
+def handle_start():
+    game_state = request.get_json()
+    start(game_state)
+    return "ok"
+
+@app.route("/move", methods=["POST"])
+def handle_move():
+    game_state = request.get_json()
+    return move(game_state)
+
+@app.route("/end", methods=["POST"])
+def handle_end():
+    game_state = request.get_json()
+    end(game_state)
+    return "ok"
+
+# For local development
 if __name__ == "__main__":
-    from flask import Flask, request
-    
-    app = Flask(__name__)
-    
-    @app.route("/")
-    def index():
-        return "BattleSnake Strategic AI Bot is running!"
-    
-    @app.route("/info", methods=["GET"])
-    def handle_info():
-        return info()
-    
-    @app.route("/start", methods=["POST"])
-    def handle_start():
-        game_state = request.get_json()
-        start(game_state)
-        return "ok"
-    
-    @app.route("/move", methods=["POST"])
-    def handle_move():
-        game_state = request.get_json()
-        return move(game_state)
-    
-    @app.route("/end", methods=["POST"])
-    def handle_end():
-        game_state = request.get_json()
-        end(game_state)
-        return "ok"
-    
-    # Run the server
     app.run(host="0.0.0.0", port=8000, debug=True)
