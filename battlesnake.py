@@ -1,281 +1,373 @@
+from typing import Dict, List, Tuple, Set
 import random
-import typing
 
 
-def info() -> typing.Dict:
+class BattleSnakeBot:
     """
-    This function is called when you create your Battlesnake on play.battlesnake.com
-    It should return a personalized response for your snake.
+    BattleSnake bot using decision tree-inspired strategies
+    Implements spatial analysis and strategic movement planning
+    """
+    
+    def __init__(self):
+        self.directions = ["up", "down", "left", "right"]
+        self.move_vectors = {
+            "up": (0, -1),
+            "down": (0, 1),
+            "left": (-1, 0),
+            "right": (1, 0)
+        }
+    
+    def get_move(self, game_state: Dict) -> str:
+        """
+        Main decision function - returns the best move
+        """
+        board = game_state["board"]
+        my_snake = game_state["you"]
+        my_head = my_snake["head"]
+        my_body = my_snake["body"]
+        health = my_snake["health"]
+        
+        # Build occupancy map (inspired by battleship grid analysis)
+        occupied = self._build_occupied_set(board, my_snake)
+        
+        # Calculate safe moves using decision tree approach
+        safe_moves = self._get_safe_moves(my_head, occupied, board)
+        
+        if not safe_moves:
+            # Last resort - try any move
+            return random.choice(self.directions)
+        
+        # Strategic move selection (inspired by minimizing "misses")
+        
+        # Priority 1: If low health, aggressively seek food
+        if health < 30:
+            food_move = self._move_toward_closest_food(
+                my_head, board["food"], safe_moves, occupied, board
+            )
+            if food_move:
+                return food_move
+        
+        # Priority 2: Control space (maximize reachable area)
+        space_scores = self._evaluate_space_control(
+            my_head, safe_moves, occupied, board
+        )
+        
+        # Priority 3: Avoid head-to-head with larger snakes
+        space_scores = self._avoid_larger_snakes(
+            my_head, safe_moves, space_scores, board, my_snake
+        )
+        
+        # Priority 4: Seek food opportunistically
+        if health < 70:
+            food_bonus = self._calculate_food_bonus(
+                my_head, board["food"], safe_moves
+            )
+            for move in safe_moves:
+                space_scores[move] += food_bonus.get(move, 0)
+        
+        # Select move with highest score
+        best_move = max(safe_moves, key=lambda m: space_scores[m])
+        return best_move
+    
+    def _build_occupied_set(self, board: Dict, my_snake: Dict) -> Set[Tuple[int, int]]:
+        """
+        Build set of occupied cells (inspired by shape detection in battleship)
+        """
+        occupied = set()
+        
+        # Add all snake bodies
+        for snake in board["snakes"]:
+            for segment in snake["body"][:-1]:  # Exclude tail (it moves)
+                occupied.add((segment["x"], segment["y"]))
+        
+        return occupied
+    
+    def _get_safe_moves(
+        self, head: Dict, occupied: Set[Tuple[int, int]], board: Dict
+    ) -> List[str]:
+        """
+        Get moves that don't immediately result in death
+        Uses decision tree logic to prune unsafe branches
+        """
+        safe = []
+        width = board["width"]
+        height = board["height"]
+        
+        for direction in self.directions:
+            dx, dy = self.move_vectors[direction]
+            new_x = head["x"] + dx
+            new_y = head["y"] + dy
+            
+            # Check bounds
+            if not (0 <= new_x < width and 0 <= new_y < height):
+                continue
+            
+            # Check collision
+            if (new_x, new_y) in occupied:
+                continue
+            
+            safe.append(direction)
+        
+        return safe
+    
+    def _move_toward_closest_food(
+        self,
+        head: Dict,
+        food: List[Dict],
+        safe_moves: List[str],
+        occupied: Set[Tuple[int, int]],
+        board: Dict
+    ) -> str:
+        """
+        Move toward closest food using Manhattan distance
+        Inspired by directional search in battleship algorithms
+        """
+        if not food:
+            return None
+        
+        # Find closest food
+        min_dist = float('inf')
+        target = None
+        for f in food:
+            dist = abs(f["x"] - head["x"]) + abs(f["y"] - head["y"])
+            if dist < min_dist:
+                min_dist = dist
+                target = f
+        
+        if not target:
+            return None
+        
+        # Score moves by distance to target
+        best_move = None
+        best_score = float('inf')
+        
+        for move in safe_moves:
+            dx, dy = self.move_vectors[move]
+            new_x = head["x"] + dx
+            new_y = head["y"] + dy
+            
+            # Check if path is somewhat clear
+            if not self._has_escape_path((new_x, new_y), occupied, board):
+                continue
+            
+            dist = abs(target["x"] - new_x) + abs(target["y"] - new_y)
+            if dist < best_score:
+                best_score = dist
+                best_move = move
+        
+        return best_move
+    
+    def _evaluate_space_control(
+        self,
+        head: Dict,
+        safe_moves: List[str],
+        occupied: Set[Tuple[int, int]],
+        board: Dict
+    ) -> Dict[str, float]:
+        """
+        Evaluate reachable space for each move using flood fill
+        Inspired by area coverage in battleship strategies
+        """
+        scores = {}
+        
+        for move in safe_moves:
+            dx, dy = self.move_vectors[move]
+            new_pos = (head["x"] + dx, head["y"] + dy)
+            
+            # Flood fill to count reachable squares
+            reachable = self._flood_fill(new_pos, occupied, board, max_depth=10)
+            scores[move] = len(reachable)
+        
+        return scores
+    
+    def _flood_fill(
+        self,
+        start: Tuple[int, int],
+        occupied: Set[Tuple[int, int]],
+        board: Dict,
+        max_depth: int = 10
+    ) -> Set[Tuple[int, int]]:
+        """
+        Flood fill to count reachable area (limited depth for performance)
+        """
+        width = board["width"]
+        height = board["height"]
+        visited = {start}
+        queue = [(start, 0)]
+        idx = 0
+        
+        while idx < len(queue) and len(visited) < 100:  # Limit for performance
+            (x, y), depth = queue[idx]
+            idx += 1
+            
+            if depth >= max_depth:
+                continue
+            
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+                
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                if (nx, ny) in occupied or (nx, ny) in visited:
+                    continue
+                
+                visited.add((nx, ny))
+                queue.append(((nx, ny), depth + 1))
+        
+        return visited
+    
+    def _has_escape_path(
+        self,
+        pos: Tuple[int, int],
+        occupied: Set[Tuple[int, int]],
+        board: Dict
+    ) -> bool:
+        """
+        Check if position has reasonable escape routes
+        """
+        reachable = self._flood_fill(pos, occupied, board, max_depth=5)
+        return len(reachable) >= 4  # Need some room to maneuver
+    
+    def _avoid_larger_snakes(
+        self,
+        head: Dict,
+        safe_moves: List[str],
+        scores: Dict[str, float],
+        board: Dict,
+        my_snake: Dict
+    ) -> Dict[str, float]:
+        """
+        Penalize moves that could lead to head-to-head with larger snakes
+        """
+        my_length = len(my_snake["body"])
+        
+        for move in safe_moves:
+            dx, dy = self.move_vectors[move]
+            new_x = head["x"] + dx
+            new_y = head["y"] + dy
+            
+            # Check adjacent cells for enemy snake heads
+            for snake in board["snakes"]:
+                if snake["id"] == my_snake["id"]:
+                    continue
+                
+                enemy_head = snake["head"]
+                enemy_length = len(snake["body"])
+                
+                # Check if enemy could move to adjacent cell
+                for edx, edy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    if (enemy_head["x"] + edx == new_x and 
+                        enemy_head["y"] + edy == new_y):
+                        
+                        if enemy_length >= my_length:
+                            # Heavily penalize head-to-head with larger/equal snake
+                            scores[move] -= 100
+        
+        return scores
+    
+    def _calculate_food_bonus(
+        self, head: Dict, food: List[Dict], safe_moves: List[str]
+    ) -> Dict[str, float]:
+        """
+        Calculate bonus for moves toward food
+        """
+        bonus = {}
+        if not food:
+            return bonus
+        
+        for move in safe_moves:
+            dx, dy = self.move_vectors[move]
+            new_x = head["x"] + dx
+            new_y = head["y"] + dy
+            
+            # Find closest food to new position
+            min_dist = float('inf')
+            for f in food:
+                dist = abs(f["x"] - new_x) + abs(f["y"] - new_y)
+                min_dist = min(min_dist, dist)
+            
+            # Bonus inversely proportional to distance
+            if min_dist > 0:
+                bonus[move] = 20.0 / min_dist
+            else:
+                bonus[move] = 100  # Food is on this square!
+        
+        return bonus
+
+
+# BattleSnake API endpoints
+def info() -> Dict:
+    """
+    Return snake appearance and metadata
     """
     return {
         "apiversion": "1",
-        "author": "Dumas",
-        "color": "#2B06066E",
+        "author": "Strategic-AI",
+        "color": "#00FF00",
         "head": "default",
         "tail": "default",
     }
 
 
-def start(game_state: typing.Dict):
+def start(game_state: Dict):
     """
-    This function is called every time your snake enters a game.
-    game_state is a dictionary containing information about the game.
+    Called when a new game starts
     """
-    print("GAME START")
+    print(f"Game {game_state['game']['id']} started!")
 
 
-def end(game_state: typing.Dict):
+def move(game_state: Dict) -> Dict:
     """
-    This function is called when your snake dies or the game ends.
+    Called on each turn - return the move decision
     """
-    print("GAME OVER")
+    bot = BattleSnakeBot()
+    chosen_move = bot.get_move(game_state)
+    
+    print(f"Turn {game_state['turn']}: Moving {chosen_move}")
+    
+    return {
+        "move": chosen_move,
+        "shout": "Strategizing!"
+    }
 
 
-def move(game_state: typing.Dict) -> typing.Dict:
+def end(game_state: Dict):
     """
-    This function is called on every turn and returns your move.
-    Valid moves are "up", "down", "left", "right".
+    Called when the game ends
     """
-    # Get game information
-    my_snake = game_state["you"]
-    my_head = my_snake["head"]
-    my_body = my_snake["body"]
-    my_health = my_snake["health"]
-    board_width = game_state["board"]["width"]
-    board_height = game_state["board"]["height"]
-    food = game_state["board"]["food"]
-    snakes = game_state["board"]["snakes"]
-
-    # Calculate safe moves
-    safe_moves = get_safe_moves(my_head, my_body, board_width, board_height, snakes)
-
-    if not safe_moves:
-        print("No safe moves available!")
-        return {"move": "up"}
-
-    # Priority 1: Avoid immediate death
-    if len(safe_moves) == 1:
-        return {"move": safe_moves[0]}
-
-    # Priority 2: Go for food if health is low
-    if my_health < 30 and food:
-        food_move = move_towards_food(my_head, food, safe_moves)
-        if food_move:
-            return {"move": food_move}
-
-    # Priority 3: Control center and avoid other snakes
-    best_move = choose_best_move(
-        my_head, my_body, safe_moves, board_width, board_height, snakes, food
-    )
-
-    return {"move": best_move}
+    print(f"Game {game_state['game']['id']} ended!")
 
 
-def get_safe_moves(head, body, board_width, board_height, snakes):
-    """
-    Calculate moves that won't immediately kill the snake
-    """
-    possible_moves = ["up", "down", "left", "right"]
-    safe_moves = []
-
-    for move in possible_moves:
-        new_head = get_new_head_position(head, move)
-
-        # Check if move is safe
-        if is_safe_position(new_head, body, board_width, board_height, snakes):
-            safe_moves.append(move)
-
-    return safe_moves
-
-
-def get_new_head_position(head, move):
-    """
-    Calculate the new head position for a given move
-    """
-    x, y = head["x"], head["y"]
-
-    if move == "up":
-        return {"x": x, "y": y + 1}
-    elif move == "down":
-        return {"x": x, "y": y - 1}
-    elif move == "left":
-        return {"x": x - 1, "y": y}
-    elif move == "right":
-        return {"x": x + 1, "y": y}
-
-
-def is_safe_position(pos, my_body, board_width, board_height, snakes):
-    """
-    Check if a position is safe to move to
-    """
-    x, y = pos["x"], pos["y"]
-
-    # Check board boundaries
-    if x < 0 or x >= board_width or y < 0 or y >= board_height:
-        return False
-
-    # Check collision with own body (excluding tail since it moves)
-    for i, body_part in enumerate(my_body[:-1]):  # Exclude tail
-        if x == body_part["x"] and y == body_part["y"]:
-            return False
-
-    # Check collision with other snakes
-    for snake in snakes:
-        for body_part in snake["body"]:
-            if x == body_part["x"] and y == body_part["y"]:
-                return False
-
-    return True
-
-
-def move_towards_food(head, food, safe_moves):
-    """
-    Find the best move towards the nearest food
-    """
-    if not food or not safe_moves:
-        return None
-
-    # Find nearest food
-    nearest_food = min(food, key=lambda f: manhattan_distance(head, f))
-
-    best_move = None
-    min_distance = float("inf")
-
-    for move in safe_moves:
-        new_head = get_new_head_position(head, move)
-        distance = manhattan_distance(new_head, nearest_food)
-
-        if distance < min_distance:
-            min_distance = distance
-            best_move = move
-
-    return best_move
-
-
-def manhattan_distance(pos1, pos2):
-    """
-    Calculate Manhattan distance between two positions
-    """
-    return abs(pos1["x"] - pos2["x"]) + abs(pos1["y"] - pos2["y"])
-
-
-def choose_best_move(head, body, safe_moves, board_width, board_height, snakes, food):
-    """
-    Choose the best move based on multiple factors
-    """
-    if len(safe_moves) == 1:
-        return safe_moves[0]
-
-    move_scores = {}
-
-    for move in safe_moves:
-        new_head = get_new_head_position(head, move)
-        score = 0
-
-        # Prefer moves towards center
-        center_x, center_y = board_width // 2, board_height // 2
-        center_distance = manhattan_distance(new_head, {"x": center_x, "y": center_y})
-        score -= center_distance * 0.1
-
-        # Prefer moves with more space (flood fill)
-        space_available = count_reachable_spaces(
-            new_head, body, board_width, board_height, snakes
-        )
-        score += space_available * 2
-
-        # Avoid moves towards larger snakes' heads
-        for snake in snakes:
-            if snake["id"] != body[0] and len(snake["body"]) >= len(
-                body
-            ):  # Larger or equal snake
-                snake_head = snake["head"]
-                if manhattan_distance(new_head, snake_head) <= 2:
-                    score -= 50  # Heavy penalty for getting close to larger snakes
-
-        # Slight preference for food if we're not in danger
-        if food and len(body) < board_width * board_height // 4:  # Not too long yet
-            nearest_food = min(food, key=lambda f: manhattan_distance(new_head, f))
-            food_distance = manhattan_distance(new_head, nearest_food)
-            score -= food_distance * 0.5
-
-        move_scores[move] = score
-
-    # Return move with highest score
-    best_move = max(move_scores, key=move_scores.get)
-    return best_move
-
-
-def count_reachable_spaces(start_pos, my_body, board_width, board_height, snakes):
-    """
-    Count how many spaces are reachable from a given position using flood fill
-    """
-    visited = set()
-    queue = [start_pos]
-    count = 0
-
-    while queue and count < 100:  # Limit search to avoid timeout
-        pos = queue.pop(0)
-        pos_key = f"{pos['x']},{pos['y']}"
-
-        if pos_key in visited:
-            continue
-
-        visited.add(pos_key)
-        count += 1
-
-        # Check all adjacent positions
-        for move in ["up", "down", "left", "right"]:
-            new_pos = get_new_head_position(pos, move)
-            new_key = f"{new_pos['x']},{new_pos['y']}"
-
-            if new_key not in visited and is_safe_position(
-                new_pos, my_body, board_width, board_height, snakes
-            ):
-                queue.append(new_pos)
-
-    return count
-
-
-# Server setup (Flask application)
-from flask import Flask, request, jsonify
-import os
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def handle_info():
-    return jsonify(info())
-
-
-@app.route("/start", methods=["POST"])
-def handle_start():
-    game_state = request.get_json()
-    start(game_state)
-    return "ok"
-
-
-@app.route("/move", methods=["POST"])
-def handle_move():
-    game_state = request.get_json()
-    return jsonify(move(game_state))
-
-
-@app.route("/end", methods=["POST"])
-def handle_end():
-    game_state = request.get_json()
-    end(game_state)
-    return "ok"
-
-
-@app.route("/health")
-def health_check():
-    return jsonify({"status": "healthy"})
-
-
+# Flask server setup (if running as web service)
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    debug = os.environ.get("DEBUG", "False").lower() == "true"
-    app.run(host="0.0.0.0", port=port, debug=debug)
-
-# To run the server, use the command:
+    from flask import Flask, request
+    
+    app = Flask(__name__)
+    
+    @app.route("/")
+    def index():
+        return "BattleSnake Strategic AI Bot is running!"
+    
+    @app.route("/info", methods=["GET"])
+    def handle_info():
+        return info()
+    
+    @app.route("/start", methods=["POST"])
+    def handle_start():
+        game_state = request.get_json()
+        start(game_state)
+        return "ok"
+    
+    @app.route("/move", methods=["POST"])
+    def handle_move():
+        game_state = request.get_json()
+        return move(game_state)
+    
+    @app.route("/end", methods=["POST"])
+    def handle_end():
+        game_state = request.get_json()
+        end(game_state)
+        return "ok"
+    
+    # Run the server
+    app.run(host="0.0.0.0", port=8000, debug=True)
