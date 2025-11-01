@@ -348,11 +348,8 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-@app.route("/")
-def index():
-    return "BattleSnake Strategic AI Bot is running!"
 
-@app.route("/info", methods=["GET"])
+@app.route("/", methods=["GET"])
 def handle_info():
     return info()
 
