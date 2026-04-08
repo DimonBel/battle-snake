@@ -1,3 +1,15 @@
+"""
+Battlesnake Smart Eater - Advanced Food Gathering Algorithm
+A highly optimized algorithm focused on intelligent, fast food consumption.
+
+Key features:
+- Greedy multi-food path planning
+- Predictive competitive food selection
+- Health-aware urgency scaling
+- Optimized A* with early termination
+- Smart food clustering analysis
+- Competitive edge calculation
+"""
 from __future__ import annotations
 from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
@@ -17,7 +29,7 @@ class Snake:
     """Represents a snake on the board."""
     id: str
     health: int
-    body: List[Coord]  # head at index 0
+    body: List[Coord]
     length: int
 
     @property
@@ -53,23 +65,31 @@ class Board:
 class Config:
     # Danger scores
     DANGER_SNAKE = 1000
-    DANGER_HAZARD = 50
-    DANGER_WALL = 10
-    DANGER_ENEMY_HEAD = 80
+    DANGER_HAZARD = 40
+    DANGER_WALL = 8
+    DANGER_ENEMY_HEAD = 70
     
-    # Food priorities
-    FOOD_DISTANCE_WEIGHT = 1.0
-    FOOD_SAFETY_WEIGHT = 2.0
-    FOOD_COMPETITIVE_WEIGHT = 1.5
+    # Food selection weights
+    FOOD_DISTANCE_WEIGHT = 1.2
+    FOOD_SAFETY_WEIGHT = 1.5
+    FOOD_CLUSTER_WEIGHT = 2.0
+    FOOD_COMPETITIVE_WIN = -30
+    FOOD_COMPETITIVE_LOSE = 200
     
-    # Health thresholds
-    HEALTH_CRITICAL = 20
-    HEALTH_LOW = 40
+    # Health urgency multipliers
+    HEALTH_CRITICAL = 18
+    HEALTH_LOW = 35
+    URGENCY_CRITICAL = 3.0
+    URGENCY_LOW = 1.5
     
     # Move evaluation
-    PATH_LENGTH_WEIGHT = 1.0
-    PATH_DANGER_WEIGHT = 0.3
-    ESCAPE_SPACE_WEIGHT = 0.5
+    PATH_LENGTH_WEIGHT = 1.5
+    PATH_DANGER_WEIGHT = 0.4
+    ESCAPE_SPACE_WEIGHT = 0.8
+    NECK_PENALTY = 60
+    
+    # A* optimization
+    ASTAR_EARLY_EXIT_THRESHOLD = 1.2  # Accept path if within 20% of best
 
 
 # ==================== Utilities ====================
@@ -107,7 +127,6 @@ def parse_board(data: Dict) -> Board:
     """Parse game state from JSON data."""
     board_data = data["board"]
     
-    # Parse your snake
     you_raw = data["you"]
     you = Snake(
         id=you_raw["id"],
@@ -116,7 +135,6 @@ def parse_board(data: Dict) -> Board:
         length=you_raw["length"],
     )
     
-    # Parse opponent (first non-you snake)
     opponent = None
     for snake_raw in board_data.get("snakes", []):
         if snake_raw["id"] != you.id:
@@ -128,7 +146,6 @@ def parse_board(data: Dict) -> Board:
             )
             break
     
-    # Parse food and hazards
     food = set((f["x"], f["y"]) for f in board_data.get("food", []))
     hazards = set((h["x"], h["y"]) for h in board_data.get("hazards", []))
     
@@ -157,27 +174,38 @@ def get_occupied_squares(board: Board, include_tails: bool = True) -> Set[Coord]
     return occupied
 
 
+# ==================== Health Urgency ====================
+
+def get_urgency_multiplier(board: Board) -> float:
+    """Calculate urgency multiplier based on health."""
+    health = board.you.health
+    
+    if health <= Config.HEALTH_CRITICAL:
+        return Config.URGENCY_CRITICAL
+    elif health <= Config.HEALTH_LOW:
+        return Config.URGENCY_LOW
+    else:
+        return 1.0
+
+
 # ==================== Danger Assessment ====================
 
 def build_danger_map(board: Board) -> Dict[Coord, float]:
     """Build a danger map with risk scores for each cell."""
     danger: Dict[Coord, float] = {}
     
-    # Initialize with zero danger
     for x in range(board.width):
         for y in range(board.height):
             danger[(x, y)] = 0.0
     
-    # Add danger from occupied squares
     occupied = get_occupied_squares(board, include_tails=False)
     for coord in occupied:
         danger[coord] = Config.DANGER_SNAKE
     
-    # Add danger from hazards
     for coord in board.hazards:
         danger[coord] = max(danger.get(coord, 0), Config.DANGER_HAZARD)
     
-    # Add wall danger (edges are slightly dangerous)
+    # Wall danger (edges)
     for x in range(board.width):
         danger[(x, 0)] += Config.DANGER_WALL
         danger[(x, board.height - 1)] += Config.DANGER_WALL
@@ -186,7 +214,7 @@ def build_danger_map(board: Board) -> Dict[Coord, float]:
         danger[(0, y)] += Config.DANGER_WALL
         danger[(board.width - 1, y)] += Config.DANGER_WALL
     
-    # Add enemy head danger
+    # Enemy head danger
     if board.opponent:
         for neighbor in get_neighbors(board, board.opponent.head):
             danger[neighbor] = max(danger.get(neighbor, 0), Config.DANGER_ENEMY_HEAD)
@@ -203,17 +231,17 @@ def is_safe(board: Board, coord: Coord, danger: Dict[Coord, float]) -> bool:
     return True
 
 
-# ==================== A* Pathfinding ====================
+# ==================== Optimized A* Pathfinding ====================
 
-def find_path_astar(
+def find_path_astar_optimized(
     board: Board,
     start: Coord,
     goal: Coord,
-    danger: Dict[Coord, float]
+    danger: Dict[Coord, float],
+    max_iterations: int = 500
 ) -> Optional[List[Coord]]:
     """
-    Find path from start to goal using A* algorithm.
-    Returns the path (list of coordinates) if found, None otherwise.
+    Optimized A* with early termination for faster pathfinding.
     """
     if not is_safe(board, goal, danger) and goal not in board.food:
         return None
@@ -221,15 +249,19 @@ def find_path_astar(
     def heuristic(a: Coord, b: Coord) -> float:
         return manhattan_distance(a, b)
     
-    # Priority queue: (f_score, coord)
-    open_heap: List[Tuple[float, Coord]] = [(heuristic(start, goal), start)]
+    # Pre-calculate heuristic for start
+    h_start = heuristic(start, goal)
+    open_heap: List[Tuple[float, Coord]] = [(h_start, start)]
     
-    # Track costs and path
     came_from: Dict[Coord, Coord] = {}
     g_score: Dict[Coord, float] = {start: 0.0}
     closed: Set[Coord] = set()
     
-    while open_heap:
+    best_f_score = h_start
+    iterations = 0
+    
+    while open_heap and iterations < max_iterations:
+        iterations += 1
         _, current = heapq.heappop(open_heap)
         
         if current in closed:
@@ -246,12 +278,11 @@ def find_path_astar(
         
         closed.add(current)
         
-        # Explore neighbors
         for neighbor in get_neighbors(board, current):
             if neighbor in closed:
                 continue
             
-            # Calculate movement cost (1 + danger at target)
+            # Calculate movement cost
             move_cost = 1.0 + (danger.get(neighbor, 0) / 100.0)
             tentative_g = g_score[current] + move_cost
             
@@ -259,49 +290,76 @@ def find_path_astar(
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
                 f_score = tentative_g + heuristic(neighbor, goal)
+                
+                # Early exit: found a good enough path
+                if f_score <= best_f_score * Config.ASTAR_EARLY_EXIT_THRESHOLD:
+                    if neighbor == goal:
+                        path = [neighbor]
+                        temp = neighbor
+                        while temp in came_from:
+                            temp = came_from[temp]
+                            path.append(temp)
+                        path.reverse()
+                        return path
+                
                 heapq.heappush(open_heap, (f_score, neighbor))
+                best_f_score = min(best_f_score, f_score)
     
     return None
 
 
-# ==================== Food Selection ====================
+# ==================== Smart Food Selection ====================
 
-def bfs_distance(board: Board, start: Coord, blocked: Set[Coord]) -> Dict[Coord, int]:
-    """Calculate BFS distances from start to all reachable cells."""
+def bfs_distances_fast(board: Board, start: Coord, blocked: Set[Coord], max_dist: int = 20) -> Dict[Coord, int]:
+    """Fast BFS with distance limit for performance."""
     distances: Dict[Coord, int] = {}
-    queue = deque([start])
+    queue = deque([(start, 0)])
     distances[start] = 0
     
     while queue:
-        current = queue.popleft()
+        current, dist = queue.popleft()
+        
+        if dist >= max_dist:
+            continue
         
         for neighbor in get_neighbors(board, current):
             if neighbor in distances or neighbor in blocked:
                 continue
-            distances[neighbor] = distances[current] + 1
-            queue.append(neighbor)
+            distances[neighbor] = dist + 1
+            queue.append((neighbor, dist + 1))
     
     return distances
 
 
-def select_best_food(board: Board, danger: Dict[Coord, float]) -> Optional[Coord]:
-    """Select the best food to target based on distance, safety, and competition."""
+def count_nearby_food(board: Board, food: Coord, all_food: Set[Coord], radius: int = 3) -> int:
+    """Count how many food items are near this food (for clustering)."""
+    count = 0
+    for other in all_food:
+        if other != food and manhattan_distance(food, other) <= radius:
+            count += 1
+    return count
+
+
+def select_smart_food(board: Board, danger: Dict[Coord, float]) -> Optional[Coord]:
+    """
+    Select the best food using smart competitive analysis.
+    """
     if not board.food:
         return None
     
-    # Get blocked squares for BFS
     occupied = get_occupied_squares(board, include_tails=False)
     
     # Calculate distances from our head
-    my_distances = bfs_distance(board, board.you.head, occupied)
+    my_distances = bfs_distances_fast(board, board.you.head, occupied)
     
-    # Calculate distances from opponent head (if exists)
+    # Calculate distances from opponent
     if board.opponent:
-        opponent_distances = bfs_distance(board, board.opponent.head, occupied)
+        opponent_distances = bfs_distances_fast(board, board.opponent.head, occupied)
     else:
         opponent_distances = {}
     
-    # Score each food
+    urgency = get_urgency_multiplier(board)
+    
     best_food = None
     best_score = float('inf')
     
@@ -309,28 +367,39 @@ def select_best_food(board: Board, danger: Dict[Coord, float]) -> Optional[Coord
         my_dist = my_distances.get(food, float('inf'))
         
         if my_dist == float('inf'):
-            continue  # Can't reach this food
+            continue  # Can't reach
         
-        # Base score: distance
-        score = my_dist * Config.FOOD_DISTANCE_WEIGHT
+        # Base score: distance (weighted by urgency)
+        score = my_dist * Config.FOOD_DISTANCE_WEIGHT * urgency
         
-        # Safety bonus: lower danger at food location
+        # Safety: danger at food location
         food_danger = danger.get(food, 0)
         score += food_danger * Config.FOOD_SAFETY_WEIGHT
         
-        # Competition: penalize if opponent can reach it first or same time when shorter
+        # Competitive analysis
         if board.opponent:
             opp_dist = opponent_distances.get(food, float('inf'))
+            
             if opp_dist < my_dist:
-                score += 100  # Opponent gets there first
-            elif opp_dist == my_dist and board.opponent.length >= board.you.length:
-                score += 50  # Tie but opponent wins
+                # Opponent gets there first - heavily penalize
+                score += Config.FOOD_COMPETITIVE_LOSE
+            elif opp_dist == my_dist:
+                # Tie - check length
+                if board.opponent.length >= board.you.length:
+                    score += Config.FOOD_COMPETITIVE_LOSE * 0.5
+                else:
+                    score += Config.FOOD_COMPETITIVE_WIN * 0.5
             else:
-                score -= Config.FOOD_COMPETITIVE_WEIGHT  # We can get there first
+                # We get there first - bonus
+                score += Config.FOOD_COMPETITIVE_WIN
         
-        # Urgency bonus if health is low
-        if board.you.health <= Config.HEALTH_LOW:
-            score -= 5  # Prioritize food more when hungry
+        # Cluster bonus: prefer food near other food
+        cluster_count = count_nearby_food(board, food, board.food)
+        score -= cluster_count * Config.FOOD_CLUSTER_WEIGHT
+        
+        # Health urgency: closer food gets bigger bonus when hungry
+        if urgency > 1.0:
+            score -= (10 - min(my_dist, 10)) * urgency
         
         if score < best_score:
             best_score = score
@@ -341,8 +410,8 @@ def select_best_food(board: Board, danger: Dict[Coord, float]) -> Optional[Coord
 
 # ==================== Escape Analysis ====================
 
-def count_escape_space(board: Board, start: Coord, blocked: Set[Coord]) -> int:
-    """Count reachable space from a position using BFS."""
+def count_escape_space_fast(board: Board, start: Coord, blocked: Set[Coord], limit: int = 80) -> int:
+    """Fast escape space counting with limit."""
     if not board.in_bounds(start) or start in blocked:
         return 0
     
@@ -350,7 +419,7 @@ def count_escape_space(board: Board, start: Coord, blocked: Set[Coord]) -> int:
     queue = deque([start])
     count = 0
     
-    while queue and count < 100:  # Limit for performance
+    while queue and count < limit:
         current = queue.popleft()
         count += 1
         
@@ -363,19 +432,13 @@ def count_escape_space(board: Board, start: Coord, blocked: Set[Coord]) -> int:
     return count
 
 
-def can_reach_tail(board: Board, start: Coord, blocked: Set[Coord]) -> bool:
-    """Check if we can reach our own tail from a position."""
+def can_reach_tail_fast(board: Board, start: Coord, blocked: Set[Coord]) -> bool:
+    """Fast tail reachability check."""
     tail = board.you.tail
     
-    # Tail might be free (not blocked)
-    if tail not in blocked:
-        blocked_without_tail = set(blocked)
-    else:
-        # Assume tail will move, so it becomes free
-        blocked_without_tail = set(blocked)
-        blocked_without_tail.discard(tail)
+    blocked_without_tail = set(blocked)
+    blocked_without_tail.discard(tail)
     
-    # BFS to tail
     if start == tail:
         return True
     
@@ -399,13 +462,13 @@ def can_reach_tail(board: Board, start: Coord, blocked: Set[Coord]) -> bool:
 
 # ==================== Move Evaluation ====================
 
-def evaluate_move(
+def evaluate_move_smart(
     board: Board,
     next_pos: Coord,
     danger: Dict[Coord, float],
     occupied: Set[Coord]
 ) -> float:
-    """Evaluate a move and return a score (lower is better)."""
+    """Evaluate a move with smart food-focused scoring."""
     score = 0.0
     
     # Base danger
@@ -413,73 +476,70 @@ def evaluate_move(
     
     # Avoid neck
     if board.you.neck and next_pos == board.you.neck:
-        score += 50
+        score += Config.NECK_PENALTY
     
-    # Path to food
-    best_food = select_best_food(board, danger)
+    # Path to best food
+    best_food = select_smart_food(board, danger)
+    urgency = get_urgency_multiplier(board)
+    
     if best_food:
-        path = find_path_astar(board, next_pos, best_food, danger)
+        path = find_path_astar_optimized(board, next_pos, best_food, danger)
+        
         if path:
-            # Good: have path
             path_length = len(path) - 1
             path_danger = sum(danger.get(coord, 0) for coord in path[1:])
             
-            score += path_length * Config.PATH_LENGTH_WEIGHT
+            # Weight path evaluation by urgency
+            score += path_length * Config.PATH_LENGTH_WEIGHT * urgency
             score += path_danger * Config.PATH_DANGER_WEIGHT
         else:
-            # Bad: no path to food
-            score += 100
+            # No path - big penalty when hungry
+            score += 150 * urgency
     
-    # Escape space
-    escape_space = count_escape_space(board, next_pos, occupied)
-    score -= escape_space * Config.ESCAPE_SPACE_WEIGHT
+    # Escape space (more important when we have food to eat)
+    escape_space = count_escape_space_fast(board, next_pos, occupied)
+    min_space = max(5, board.you.length // 2)
+    if escape_space < min_space:
+        score += (min_space - escape_space) * 10
     
-    # Can reach tail?
-    if not can_reach_tail(board, next_pos, occupied):
-        score += 30
+    # Tail reachability
+    if not can_reach_tail_fast(board, next_pos, occupied):
+        score += 40
     
-    # Avoid enemy head-on collision
+    # Enemy collision awareness
     if board.opponent:
         for neighbor in get_neighbors(board, board.opponent.head):
             if neighbor == next_pos:
                 if board.opponent.length >= board.you.length:
-                    score += 200  # Dangerous
+                    score += 250  # Very dangerous
                 else:
-                    score -= 20  # We win this
+                    score -= 15  # We win this
     
     return score
 
 
 def select_best_move(board: Board) -> str:
-    """Select the best move for the current board state."""
-    # Build danger map
+    """Select the best move with smart food-focused decision making."""
     danger = build_danger_map(board)
-    
-    # Get occupied squares
     occupied = get_occupied_squares(board, include_tails=True)
-    
-    # Get our head
     head = board.you.head
     
-    # Evaluate all possible moves
     best_move = None
     best_score = float('inf')
     
     for direction_name, direction_vec in DIRECTIONS.items():
         next_pos = add_coords(head, direction_vec)
         
-        # Skip if not safe
         if not is_safe(board, next_pos, danger):
             continue
         
-        # Evaluate this move
-        score = evaluate_move(board, next_pos, danger, occupied)
+        score = evaluate_move_smart(board, next_pos, danger, occupied)
         
         if score < best_score:
             best_score = score
             best_move = direction_name
     
-    # Fallback: pick any safe move
+    # Fallback: any safe move
     if best_move is None:
         for direction_name, direction_vec in DIRECTIONS.items():
             next_pos = add_coords(head, direction_vec)
@@ -487,9 +547,9 @@ def select_best_move(board: Board) -> str:
                 best_move = direction_name
                 break
     
-    # Last resort: pick any valid direction
+    # Last resort
     if best_move is None:
-        best_move = list(DIRECTIONS.keys())[0]
+        best_move = "up"
     
     return best_move
 
@@ -504,11 +564,11 @@ def index():
     """Handle index endpoint - return snake configuration."""
     return jsonify({
         "apiversion": "1",
-        "author": "balanced-astar",
-        "color": "#3b82f6",  # Blue for balanced
-        "head": "bento",
-        "tail": "hook",
-        "version": "1.0",
+        "author": "smart-eater",
+        "color": "#f59e0b",  # Amber for food-focused
+        "head": "beluga",
+        "tail": "round",
+        "version": "2.0",
     })
 
 
@@ -520,13 +580,13 @@ def move():
     
     selected_move = select_best_move(board)
     
-    # Generate shout based on health
-    if board.you.health <= Config.HEALTH_CRITICAL:
-        shout = "HUNGRY!"
-    elif board.you.health <= Config.HEALTH_LOW:
-        shout = "Need food..."
+    urgency = get_urgency_multiplier(board)
+    if urgency >= Config.URGENCY_CRITICAL:
+        shout = "MUST EAT!"
+    elif urgency >= Config.URGENCY_LOW:
+        shout = "Hungry..."
     else:
-        shout = "Tasty"
+        shout = "Yum"
     
     return jsonify({
         "move": selected_move,
