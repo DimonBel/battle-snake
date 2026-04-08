@@ -202,7 +202,9 @@ def select_best_move(board: Board) -> str:
     
     if path and len(path) > 1:
         next_pos = path[1]
-        return VECTOR_TO_DIR.get(next_pos, "up")
+        # Calculate direction vector from head to next_pos
+        direction_vec = (next_pos[0] - head[0], next_pos[1] - head[1])
+        return VECTOR_TO_DIR.get(direction_vec, "up")
     
     # If no path found, pick any safe move
     for direction_name, direction_vec in DIRECTIONS.items():
