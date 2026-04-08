@@ -1,260 +1,263 @@
-"""
-Battlesnake Simple A* - Clean Food-Only Algorithm
-A straightforward A* implementation focused solely on eating food.
-
-Key features:
-- Simple A* pathfinding to nearest food
-- Basic safety checks
-- Clean, minimal implementation
-"""
-from typing import Dict, List, Tuple, Optional, Set
-from dataclasses import dataclass
-import heapq
-
 from flask import Flask, request, jsonify
-
-
-# ==================== Data Structures ====================
-
-Coord = Tuple[int, int]
-
-
-@dataclass
-class Snake:
-    id: str
-    health: int
-    body: List[Coord]
-    length: int
-
-    @property
-    def head(self) -> Coord:
-        return self.body[0]
-
-    @property
-    def tail(self) -> Coord:
-        return self.body[-1]
-
-    @property
-    def neck(self) -> Optional[Coord]:
-        return self.body[1] if len(self.body) > 1 else None
-
-
-@dataclass
-class Board:
-    width: int
-    height: int
-    food: Set[Coord]
-    hazards: Set[Coord]
-    you: Snake
-    opponent: Optional[Snake]
-
-    def in_bounds(self, c: Coord) -> bool:
-        x, y = c
-        return 0 <= x < self.width and 0 <= y < self.height
-
-
-# ==================== Utilities ====================
-
-DIRECTIONS: Dict[str, Coord] = {
-    "up": (0, 1),
-    "down": (0, -1),
-    "left": (-1, 0),
-    "right": (1, 0),
-}
-
-VECTOR_TO_DIR: Dict[Coord, str] = {v: k for k, v in DIRECTIONS.items()}
-
-
-def add_coords(a: Coord, b: Coord) -> Coord:
-    return (a[0] + b[0], a[1] + b[1])
-
-
-def manhattan_distance(a: Coord, b: Coord) -> int:
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-
-def get_neighbors(board: Board, c: Coord) -> List[Coord]:
-    neighbors = []
-    for direction in DIRECTIONS.values():
-        neighbor = add_coords(c, direction)
-        if board.in_bounds(neighbor):
-            neighbors.append(neighbor)
-    return neighbors
-
-
-# ==================== Board Parsing ====================
-
-def parse_board(data: Dict) -> Board:
-    board_data = data["board"]
-    
-    you_raw = data["you"]
-    you = Snake(
-        id=you_raw["id"],
-        health=you_raw["health"],
-        body=[(p["x"], p["y"]) for p in you_raw["body"]],
-        length=you_raw["length"],
-    )
-    
-    opponent = None
-    for snake_raw in board_data.get("snakes", []):
-        if snake_raw["id"] != you.id:
-            opponent = Snake(
-                id=snake_raw["id"],
-                health=snake_raw["health"],
-                body=[(p["x"], p["y"]) for p in snake_raw["body"]],
-                length=snake_raw["length"],
-            )
-            break
-    
-    food = set((f["x"], f["y"]) for f in board_data.get("food", []))
-    hazards = set((h["x"], h["y"]) for h in board_data.get("hazards", []))
-    
-    return Board(
-        width=board_data["width"],
-        height=board_data["height"],
-        food=food,
-        hazards=hazards,
-        you=you,
-        opponent=opponent,
-    )
-
-
-def get_occupied_squares(board: Board) -> Set[Coord]:
-    occupied = set(board.you.body)
-    if board.opponent:
-        occupied.update(board.opponent.body)
-    return occupied
-
-
-# ==================== A* Pathfinding ====================
-
-def find_path_astar(board: Board, start: Coord, goal: Coord, blocked: Set[Coord]) -> Optional[List[Coord]]:
-    """
-    Simple A* pathfinding from start to goal.
-    Returns path as list of coordinates, or None if no path exists.
-    """
-    def heuristic(a: Coord, b: Coord) -> float:
-        return manhattan_distance(a, b)
-    
-    open_heap = [(heuristic(start, goal), start)]
-    came_from = {}
-    g_score = {start: 0.0}
-    closed = set()
-    
-    while open_heap:
-        _, current = heapq.heappop(open_heap)
-        
-        if current in closed:
-            continue
-        
-        if current == goal:
-            path = [current]
-            while current in came_from:
-                current = came_from[current]
-                path.append(current)
-            path.reverse()
-            return path
-        
-        closed.add(current)
-        
-        for neighbor in get_neighbors(board, current):
-            if neighbor in blocked or neighbor in closed:
-                continue
-            
-            tentative_g = g_score[current] + 1.0
-            
-            if tentative_g < g_score.get(neighbor, float('inf')):
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                f_score = tentative_g + heuristic(neighbor, goal)
-                heapq.heappush(open_heap, (f_score, neighbor))
-    
-    return None
-
-
-# ==================== Move Selection ====================
-
-def select_best_move(board: Board) -> str:
-    """Select the best move using A* to nearest food."""
-    blocked = get_occupied_squares(board)
-    head = board.you.head
-    
-    # Find nearest food
-    nearest_food = None
-    nearest_dist = float('inf')
-    
-    for food in board.food:
-        dist = manhattan_distance(head, food)
-        if dist < nearest_dist:
-            nearest_dist = dist
-            nearest_food = food
-    
-    # If no food, just pick a safe direction
-    if not nearest_food:
-        for direction_name, direction_vec in DIRECTIONS.items():
-            next_pos = add_coords(head, direction_vec)
-            if board.in_bounds(next_pos) and next_pos not in blocked:
-                return direction_name
-        return "up"
-    
-    # Find path to nearest food
-    path = find_path_astar(board, head, nearest_food, blocked)
-    
-    if path and len(path) > 1:
-        next_pos = path[1]
-        # Calculate direction vector from head to next_pos
-        direction_vec = (next_pos[0] - head[0], next_pos[1] - head[1])
-        return VECTOR_TO_DIR.get(direction_vec, "up")
-    
-    # If no path found, pick any safe move
-    for direction_name, direction_vec in DIRECTIONS.items():
-        next_pos = add_coords(head, direction_vec)
-        if board.in_bounds(next_pos) and next_pos not in blocked:
-            return direction_name
-    
-    return "up"
-
-
-# ==================== Flask Server ====================
+import heapq
+import collections
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 
-@app.route("/")
+class BattlesnakeAI:
+    """
+    A high-performance Battlesnake AI using A* Pathfinding integrated with
+    an Influence Map (Analog potential field) and Flood Fill for survival.
+    """
+
+    def __init__(self, game_state):
+        self.board = game_state["board"]
+        self.width = self.board["width"]
+        self.height = self.board["height"]
+        self.you = game_state["you"]
+        self.my_head = (self.you["head"]["x"], self.you["head"]["y"])
+        self.my_body = [(p["x"], p["y"]) for p in self.you["body"]]
+        self.snakes = self.board["snakes"]
+        self.hazards = [(h["x"], h["y"]) for h in self.board["hazards"]]
+        self.food = [(f["x"], f["y"]) for f in self.board["food"]]
+
+        # Pre-calculate occupied tiles
+        self.occupied = set()
+        for snake in self.snakes:
+            for part in snake["body"][:-1]:  # Tail might move
+                self.occupied.add((part["x"], part["y"]))
+
+    def get_neighbors(self, pos):
+        x, y = pos
+        neighbors = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+        return [
+            n for n in neighbors if 0 <= n[0] < self.width and 0 <= n[1] < self.height
+        ]
+
+    def manhattan(self, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def get_influence_cost(self, pos):
+        """
+        The 'Analog' part: Calculates a potential field cost for a tile.
+        """
+        cost = 1
+
+        # 1. Proximity to other snake heads
+        for snake in self.snakes:
+            if snake["id"] == self.you["id"]:
+                continue
+
+            head = (snake["head"]["x"], snake["head"]["y"])
+            dist = self.manhattan(pos, head)
+
+            if dist == 1:
+                # Potential head-on collision
+                if snake["length"] >= self.you["length"]:
+                    cost += 100  # Lethal
+                else:
+                    cost -= 10  # Advantage
+            elif dist == 2:
+                # Threat zone
+                cost += 20
+
+        # 2. Hazards
+        if pos in self.hazards:
+            cost += 15
+
+        # 3. Edge/Corner penalty (staying central is usually better)
+        dist_to_edge_x = min(pos[0], self.width - 1 - pos[0])
+        dist_to_edge_y = min(pos[1], self.height - 1 - pos[1])
+        if dist_to_edge_x == 0 or dist_to_edge_y == 0:
+            cost += 2
+
+        return cost
+
+    def a_star(self, start, goal):
+        """
+        A* pathfinding with influence map heuristic.
+        """
+        frontier = []
+        heapq.heappush(frontier, (0, start))
+        came_from = {start: None}
+        cost_so_far = {start: 0}
+
+        while frontier:
+            _, current = heapq.heappop(frontier)
+
+            if current == goal:
+                break
+
+            for next_pos in self.get_neighbors(current):
+                if next_pos in self.occupied:
+                    continue
+
+                new_cost = cost_so_far[current] + self.get_influence_cost(next_pos)
+                if next_pos not in cost_so_far or new_cost < cost_so_far[next_pos]:
+                    cost_so_far[next_pos] = new_cost
+                    priority = new_cost + self.manhattan(goal, next_pos)
+                    heapq.heappush(frontier, (priority, next_pos))
+                    came_from[next_pos] = current
+
+        if goal not in came_from:
+            return None
+
+        path = []
+        curr = goal
+        while curr != start:
+            path.append(curr)
+            curr = came_from[curr]
+        return path[::-1]
+
+    def flood_fill(self, start):
+        """
+        Measures reachable area from 'start'.
+        """
+        if start in self.occupied:
+            return 0
+
+        visited = {start}
+        queue = collections.deque([start])
+        count = 0
+
+        while queue:
+            curr = queue.popleft()
+            count += 1
+            for n in self.get_neighbors(curr):
+                if n not in visited and n not in self.occupied:
+                    visited.add(n)
+                    queue.append(n)
+        return count
+
+    def get_move(self):
+        """
+        Decision logic:
+        1. If hungry or small, find path to food.
+        2. If safe path to food exists, take it.
+        3. Otherwise, move to the largest available space.
+        """
+        # Sort food by distance
+        sorted_food = sorted(self.food, key=lambda f: self.manhattan(self.my_head, f))
+
+        # Strategy A: Go for food if health is low or we are small
+        if self.you["health"] < 50 or self.you["length"] < 10:
+            for food_pos in sorted_food[:3]:
+                path = self.a_star(self.my_head, food_pos)
+                if path:
+                    # Check if taking the first step is safe
+                    if self.flood_fill(path[0]) >= self.you["length"]:
+                        return self.to_direction(path[0])
+
+        # Strategy B: Find any safe move that maximizes space
+        best_move = None
+        max_space = -1
+
+        for n in self.get_neighbors(self.my_head):
+            if n in self.occupied:
+                continue
+
+            space = self.flood_fill(n)
+            # Add a bit of influence cost to the space score to prefer safer areas
+            score = space - (self.get_influence_cost(n) * 0.5)
+
+            if score > max_space:
+                max_space = score
+                best_move = n
+
+        if best_move:
+            return self.to_direction(best_move)
+
+        # Last resort: just move anywhere not occupied
+        for n in self.get_neighbors(self.my_head):
+            if n not in self.occupied:
+                return self.to_direction(n)
+
+        return "up"  # Good luck!
+
+    def to_direction(self, target):
+        tx, ty = target
+        hx, hy = self.my_head
+        if tx > hx:
+            return "right"
+        if tx < hx:
+            return "left"
+        if ty > hy:
+            return "up"
+        if ty < hy:
+            return "down"
+        return "up"
+
+
+# Battlesnake API Routes
+
+
+@app.get("/")
 def index():
-    return jsonify({
-        "apiversion": "1",
-        "author": "simple-astar",
-        "color": "#10b981",
-        "head": "safe",
-        "tail": "small",
-        "version": "1.0",
-    })
+    """
+    Your Battlesnake API info endpoint.
+    """
+    return jsonify(
+        {
+            "apiversion": "1",
+            "author": "Manus AI",
+            "color": "#FF3CF5",
+            "head": "default",
+            "tail": "default",
+            "version": "1.0.0",
+        }
+    )
 
 
-@app.route("/move", methods=["POST"])
-def move():
-    data = request.get_json()
-    board = parse_board(data)
-    
-    selected_move = select_best_move(board)
-    
-    return jsonify({
-        "move": selected_move,
-        "shout": "Hungry"
-    })
-
-
-@app.route("/start", methods=["POST"])
+@app.post("/start")
 def start():
-    return "", 200
+    """
+    Called when your Battlesnake begins a game.
+    """
+    data = request.get_json()
+    game_id = data["game"]["id"]
+    board_width = data["board"]["width"]
+    board_height = data["board"]["height"]
+
+    app.logger.info(f"Game {game_id} started on {board_width}x{board_height} board")
+
+    return "ok"
 
 
-@app.route("/end", methods=["POST"])
+@app.post("/move")
+def move():
+    """
+    Called for every turn of each game.
+    Returns your next move.
+    """
+    data = request.get_json()
+
+    try:
+        ai = BattlesnakeAI(data)
+        next_move = ai.get_move()
+
+        app.logger.info(f"Move: {next_move}")
+
+        return jsonify({"move": next_move})
+    except Exception as e:
+        app.logger.error(f"Error in move: {str(e)}")
+        return jsonify({"move": "up"})
+
+
+@app.post("/end")
 def end():
-    return "", 200
+    """
+    Called when a game your Battlesnake was in ends.
+    """
+    data = request.get_json()
+    game_id = data["game"]["id"]
+
+    app.logger.info(f"Game {game_id} ended")
+
+    return "ok"
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(debug=True, host="0.0.0.0", port=8000)
