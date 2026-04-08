@@ -203,7 +203,7 @@ def index():
         {
             "apiversion": "1",
             "author": "Manus AI",
-            "color": "#FF3CF5",
+            "color": "#1100FC",
             "head": "default",
             "tail": "default",
             "version": "1.0.0",
